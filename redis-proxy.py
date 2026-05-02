@@ -20,68 +20,105 @@ Environment variables:
     REDIS_PASS: Redis password
 """
 
-import os, asyncio
+import os
+import asyncio
+import logging
 
-REDIS_HOST = os.getenv("REDIS_HOST")
-REDIS_PORT = os.getenv("REDIS_PORT")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_USER = os.getenv("REDIS_USER")
 REDIS_PASS = os.getenv("REDIS_PASS")
 
-# Validate all required environment variables are set
-required_vars = {
-    "REDIS_HOST": REDIS_HOST,
-    "REDIS_PORT": REDIS_PORT,
-    "REDIS_USER": REDIS_USER,
-    "REDIS_PASS": REDIS_PASS
-}
+if not REDIS_PASS:
+  logging.error("CRITICAL: REDIS_PASS is missing!")
+  exit(1)
 
-missing_vars = [var for var, value in required_vars.items() if not value]
-if missing_vars:
-    raise EnvironmentError(f"Required environment variables not set: {', '.join(missing_vars)}")
 
-REDIS_PORT = int(REDIS_PORT)
+async def pipe(reader, writer):
+  """Handles bidirectional data flow and closes cleanly on error"""
+  try:
+    while True:
+      data = await reader.read(8192)  # 8KB Buffer
+      if not data:
+        break
+      writer.write(data)
+      await writer.drain()
+  except Exception:
+    pass
+  finally:
+    try:
+      writer.close()
+    except:
+      pass
+
 
 async def handle_client(client_reader, client_writer):
-    # Connect to real Redis
-    try:
-        server_reader, server_writer = await asyncio.open_connection(REDIS_HOST, REDIS_PORT)
-    except Exception as e:
-        print(f"Upstream connection failed: {e}")
-        client_writer.close()
-        return
+  peer = client_writer.get_extra_info('peername')
 
-    # Send AUTH right away
-    auth_cmd = f"*3\r\n$4\r\nAUTH\r\n${len(REDIS_USER)}\r\n{REDIS_USER}\r\n${len(REDIS_PASS)}\r\n{REDIS_PASS}\r\n"
-    server_writer.write(auth_cmd.encode())
+  # --- STEP A: FILTER HEALTHCHECKS (The "Security Attack" Fix) ---
+  try:
+    # Peek at the first byte to see if it's HTTP (G=GET, P=POST, H=HEAD)
+    first_byte = await client_reader.read(1)
+
+    if not first_byte:
+      client_writer.close()
+      return
+
+    if first_byte in [b'G', b'P', b'H', b'O', b'D']:
+      logging.warning(f"Ignored HTTP Healthcheck from {peer}")
+      client_writer.close()
+      return
+
+  except Exception:
+    client_writer.close()
+    return
+
+  # --- STEP B: CONNECT UPSTREAM ---
+  try:
+    server_reader, server_writer = await asyncio.open_connection(REDIS_HOST, REDIS_PORT)
+  except Exception as e:
+    logging.error(f"Upstream Connect Failed ({REDIS_HOST}:{REDIS_PORT}): {e}")
+    client_writer.close()
+    return
+
+  # --- STEP C: AUTHENTICATE ---
+  try:
+    # Reconstruct Redis AUTH command
+    auth_payload = f"*3\r\n$4\r\nAUTH\r\n${len(REDIS_USER)}\r\n{REDIS_USER}\r\n${len(REDIS_PASS)}\r\n{REDIS_PASS}\r\n"
+    server_writer.write(auth_payload.encode())
     await server_writer.drain()
 
-    # Read and discard AUTH response (don’t forward to client)
+    # Consume the response (+OK) so the client doesn't see it
     await server_reader.readuntil(b"\r\n")
 
-    async def pipe(reader, writer):
-        try:
-            while True:
-                data = await reader.read(4096)
-                if not data:
-                    break
-                writer.write(data)
-                await writer.drain()
-        except Exception:
-            pass
-        finally:
-            writer.close()
+  except Exception as e:
+    logging.error(f"Auth Handshake Failed: {e}")
+    client_writer.close()
+    if server_writer:
+      server_writer.close()
+    return
 
-    # Pipe client→server and server→client concurrently
-    await asyncio.gather(
-        pipe(client_reader, server_writer),
-        pipe(server_reader, client_writer),
-    )
+  # --- STEP D: START PIPING ---
+  # Forward that first byte we peeked at earlier
+  server_writer.write(first_byte)
+
+  await asyncio.gather(
+      pipe(client_reader, server_writer),
+      pipe(server_reader, client_writer),
+  )
+
 
 async def main():
-    server = await asyncio.start_server(handle_client, "0.0.0.0", 6379)
-    print("Proxy listening on port 6379...")
-    async with server:
-        await server.serve_forever()
+  server = await asyncio.start_server(handle_client, "0.0.0.0", 6379)
+  logging.info(f"Proxy Online -> {REDIS_HOST}:{REDIS_PORT}")
+  async with server:
+    await server.serve_forever()
 
 if __name__ == "__main__":
+  try:
     asyncio.run(main())
+  except KeyboardInterrupt:
+    pass
