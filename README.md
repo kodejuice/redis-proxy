@@ -30,7 +30,32 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 
 ---
 
+
 ## Use cases
 
 * Drop-in replacement for `redis:alpine` in development or containerized stacks.
 * Provide a local Redis endpoint even when the actual server is remote.
+
+### Why?
+
+I built this as a fix to an issue with self-hosted [`Appwrite`](https://appwrite.io) where you the Redis server you set must not be password authenticated
+
+```yml
+  # A custom redis-proxy, this is to get around an appwrite bug that 
+  # required that our redis server be without AUTH
+  # Our redis-proxy connects to our redis server with AUTH
+  # then exposes a redis port that has no AUTH 
+  redis:
+    image: sochimab/redis-proxy:latest
+    container_name: appwrite-redis
+    <<: *x-logging
+    restart: unless-stopped
+    networks:
+      - appwrite
+    environment:
+      - REDIS_HOST=${_CUSTOM_REDIS_HOST}
+      - REDIS_PORT=${_CUSTOM_REDIS_PORT}
+      - REDIS_USER=${_CUSTOM_REDIS_USERNAME}
+      - REDIS_PASS=${_CUSTOM_REDIS_PASSWORD}
+```
+
